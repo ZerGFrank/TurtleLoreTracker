@@ -1,0 +1,9 @@
+## Interface: 11200
+## Title: |cff39ff14Turtle|r|cffffffffLoreTracker|r
+## Notes: Lorekeeper-style quest progress tracker using pfQuest & pfQuest-turtle (this is a work-in-progress)
+## Author: Geomi
+## Version: 1.0.0
+## RequiredDeps: pfQuest, pfQuest-turtle
+## SavedVariables: TurtleLoreTrackerDB
+
+TurtleLoreTracker.lua
