@@ -1,269 +1,154 @@
--- TurtleLoreTracker.lua
--- Lorekeeper helper for Turtle WoW
--- Requires: pfQuest + pfQuest-turtle
+-- Turtle Lore Tracker
+-- Turtle WoW 1.12 / Lua 5.0
+-- Depends on: pfQuest + pfQuest-turtle
 
-local ADDON_NAME = "TurtleLoreTracker"
-
--- local refs for tiny perf / clarity
-local pairs, ipairs, type, tonumber, tostring = pairs, ipairs, type, tonumber, tostring
-local floor = math.floor
-
-TurtleLoreTrackerDB = TurtleLoreTrackerDB or {}
-
-local frame = CreateFrame("Frame")
-local enabled = true
-local charDB
-local questIndexByZone = {}
-local totalQuests = 0
-
--- simple prefix print
 local function TLT_Print(msg)
   if DEFAULT_CHAT_FRAME then
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99TLT:|r " .. tostring(msg))
   end
 end
 
--- per-character DB
-local function TLT_GetCharDB()
-  local realm = GetRealmName() or "Unknown"
-  local name = UnitName("player") or "Unknown"
+-- ############################################################
+-- SavedVariables
+-- ############################################################
 
-  local rdb = TurtleLoreTrackerDB[realm]
-  if not rdb then
-    rdb = {}
-    TurtleLoreTrackerDB[realm] = rdb
+TurtleLoreTrackerDB = TurtleLoreTrackerDB or {}
+local db
+local totalQuests = 0
+
+local function TLT_InitDB()
+  if type(TurtleLoreTrackerDB) ~= "table" then
+    TurtleLoreTrackerDB = {}
   end
-
-  local cdb = rdb[name]
-  if not cdb then
-    cdb = { completed = {} }
-    rdb[name] = cdb
+  if type(TurtleLoreTrackerDB.completed) ~= "table" then
+    TurtleLoreTrackerDB.completed = {}
   end
-
-  cdb.completed = cdb.completed or {}
-  return cdb
+  if type(TurtleLoreTrackerDB.importedOnce) ~= "boolean" then
+    TurtleLoreTrackerDB.importedOnce = false
+  end
+  db = TurtleLoreTrackerDB
 end
 
--- pfQuest / pfQuest-turtle presence & db sanity
+-- ############################################################
+-- pfQuest helpers
+-- ############################################################
+
 local function TLT_PfQuestReady()
-  return pfQuest and pfDatabase and pfDB
-     and pfDB["quests"] and pfDB["quests"]["loc"]
+  return pfDB and pfDB["quests"]
 end
 
--- import pfQuest_history into our DB
-local function TLT_SyncFromPfQuestHistory()
-  if not TLT_PfQuestReady() then return end
-  if not pfQuest_history then return end
-  if not charDB then return end
+-- One-time import from pfQuest_history into our own DB
+local function TLT_ImportPfQuestHistory()
+  if not db or db.importedOnce then return end
+  if type(pfQuest_history) ~= "table" then return end
 
-  local completed = charDB.completed
+  local completed = db.completed
   for qid, _ in pairs(pfQuest_history) do
     local id = tonumber(qid)
     if id then
       completed[id] = true
     end
   end
+
+  db.importedOnce = true
 end
 
--- build: zoneKey -> { quests = { [id] = title }, completed = n }
--- notes:
--- - Uses pfDB["quests"]["loc"] for titles.
--- - Tries to derive a "zone/sort" from pfDB["quests"]["data"][id].
--- - Falls back to "Unknown" when structure isn't obvious.
-local function TLT_BuildQuestIndex()
-  questIndexByZone = {}
+-- Count how many quests exist in pfQuest's DB
+local function TLT_BuildQuestCount()
   totalQuests = 0
+  if not TLT_PfQuestReady() then return end
 
-  if not TLT_PfQuestReady() then
-    return
-  end
+  local q = pfDB["quests"]
+  local src = q["data"] or q["enUS"] or q["loc"] or q
 
-  local loc = pfDB["quests"]["loc"]
-  if not loc then return end
+  if type(src) ~= "table" then return end
 
-  local data = pfDB["quests"]["data"]
-  local zonesLoc = pfDB["zones"] and pfDB["zones"]["loc"]
-
-  for qid, entry in pairs(loc) do
-    local id = tonumber(qid)
-    if id then
-      local title = (type(entry) == "table" and (entry.T or entry[1])) or ("Quest " .. id)
-      local zoneKey = "Unknown"
-
-      if data and data[id] then
-        local d = data[id]
-
-        -- pfQuest DB uses compact encodings; we keep this intentionally loose
-        if type(d) == "table" then
-          local sort = d[1]
-          if zonesLoc and sort and zonesLoc[sort] then
-            zoneKey = zonesLoc[sort]
-          elseif sort then
-            zoneKey = tostring(sort)
-          end
-        end
-        -- if it's a string encoding, we skip parsing to stay robust
-      end
-
-      if not questIndexByZone[zoneKey] then
-        questIndexByZone[zoneKey] = { quests = {}, completed = 0 }
-      end
-
-      questIndexByZone[zoneKey].quests[id] = title
+  for id, _ in pairs(src) do
+    if type(id) == "number" then
       totalQuests = totalQuests + 1
     end
   end
-
-  -- count completed per-zone based on our completed set
-  local completed = charDB and charDB.completed or {}
-  for zone, info in pairs(questIndexByZone) do
-    local c = 0
-    for id in pairs(info.quests) do
-      if completed[id] then
-        c = c + 1
-      end
-    end
-    info.completed = c
-  end
 end
 
--- total progress
-local function TLT_GetProgress()
-  local completed = 0
-  local completedSet = charDB and charDB.completed or {}
+-- How many completions we know about (client-side)
+local function TLT_CountCompleted()
+  if not db or type(db.completed) ~= "table" then return 0 end
+  local c = 0
+  for _, v in pairs(db.completed) do
+    if v then c = c + 1 end
+  end
+  return c
+end
 
-  for _, done in pairs(completedSet) do
-    if done then completed = completed + 1 end
+-- ############################################################
+-- UI (lazy-created)
+-- ############################################################
+
+local uiFrame, progressFS, infoFS, bodyFS, resyncBtn
+
+local function TLT_UpdateDisplay()
+  if not uiFrame then return end
+
+  if not db then
+    progressFS:SetText("Database not ready.")
+    infoFS:SetText("")
+    bodyFS:SetText("")
+    return
+  end
+
+  if totalQuests == 0 then
+    progressFS:SetText("pfQuest data not ready.")
+    infoFS:SetText("")
+    bodyFS:SetText("Make sure pfQuest and pfQuest-turtle are enabled,\nthen click |cffffffffResync|r.")
+    return
+  end
+
+  local done = TLT_CountCompleted()
+  if done > totalQuests then
+    done = totalQuests
   end
 
   local pct = 0
   if totalQuests > 0 then
-    pct = floor((completed / totalQuests) * 100)
+    pct = math.floor((done / totalQuests) * 1000) / 10 -- 1 decimal place
   end
 
-  return completed, totalQuests, pct
-end
+  local missing = totalQuests - done
 
--- ===== UI =====
+  progressFS:SetText(string.format(
+    "Lorekeeper Progress: |cff00ff00%d|r / %d (%.1f%%)",
+    done, totalQuests, pct
+  ))
 
-local ui = {
-  frame = nil,
-  summary = nil,
-  scroll = nil,
-  rows = {},
-  rowsCount = 12,
-}
+  infoFS:SetText(string.format(
+    "Client-tracked completions. Missing (not known here): |cffff6666%d|r",
+    missing
+  ))
 
-local function TLT_ShowMissingOnMap(zoneKey)
-  if not TLT_PfQuestReady() then
-    TLT_Print("pfQuest not ready, cannot show quests on map.")
-    return
-  end
-
-  local bucket = questIndexByZone[zoneKey]
-  if not bucket then return end
-
-  local completed = charDB.completed
-  local added = 0
-
-  if pfDatabase and pfDatabase.SearchQuestID then
-    for id, _ in pairs(bucket.quests) do
-      if not completed[id] and not (pfQuest.questlog and pfQuest.questlog[id]) then
-        pfDatabase:SearchQuestID(id, { ["addon"] = "TLT" })
-        added = added + 1
-      end
-    end
-  end
-
-  if added > 0 then
-    TLT_Print("Showing " .. added .. " missing quests in " .. zoneKey .. " via pfQuest.")
-  else
-    TLT_Print("No missing quests found for " .. zoneKey .. ".")
-  end
-end
-
-local function TLT_GetSortedZones()
-  local list = {}
-  local completed = charDB.completed
-
-  for zone, info in pairs(questIndexByZone) do
-    local total = 0
-    for _ in pairs(info.quests) do total = total + 1 end
-
-    local missing = total - (info.completed or 0)
-    list[table.getn(list) + 1] = {
-      zone = zone,
-      total = total,
-      completed = info.completed or 0,
-      missing = missing,
-    }
-  end
-
-  table.sort(list, function(a, b)
-    -- prioritize zones with more missing quests
-    if a.missing ~= b.missing then
-      return a.missing > b.missing
-    end
-    return (a.zone or "") < (b.zone or "")
-  end)
-
-  return list
-end
-
-function TurtleLoreTracker_RefreshRows()
-  if not ui.frame or not ui.frame:IsShown() then return end
-
-  local zones = TLT_GetSortedZones()
-  local numZones = table.getn(zones)
-
-  FauxScrollFrame_Update(ui.scroll, numZones, ui.rowsCount, 18)
-
-  local offset = FauxScrollFrame_GetOffset(ui.scroll)
-
-  for i = 1, ui.rowsCount do
-    local row = ui.rows[i]
-    local index = i + offset
-    local data = zones[index]
-
-    if data then
-      row.zoneKey = data.zone
-
-      local color
-      if data.missing > 0 then
-        color = "|cffff8080" -- red-ish for missing
-      else
-        color = "|cff80ff80" -- green for complete
-      end
-
-      row.text:SetText(string.format(
-        "%s%s|r  -  %d / %d  (missing %d)",
-        color, data.zone or "Unknown",
-        data.completed, data.total, data.missing
-      ))
-      row:Show()
-    else
-      row.zoneKey = nil
-      row.text:SetText("")
-      row:Hide()
-    end
-  end
-end
-
-function TurtleLoreTracker_UpdateUI()
-  if not ui.frame then return end
-  local done, total, pct = TLT_GetProgress()
-  ui.summary:SetText(
-    string.format("Lorekeeper Progress: |cff33ff99%d|r / %d  (%d%%)", done, total, pct)
+  bodyFS:SetText(
+    "What this addon does:\n" ..
+    "• Counts quests from pfQuest.\n" ..
+    "• On |cffffffffResync|r, imports known completed quest IDs\n" ..
+    "  from pfQuest_history into its own database.\n" ..
+    "• Your Lorekeeper data here survives if you clear or break pfQuest.\n\n" ..
+    "Why it may not match /played:\n" ..
+    "• 1.12 offers no full quest-history API to addons.\n" ..
+    "• Quests done before pfQuest/TLT or after wipes may be missing.\n\n" ..
+    "How to use for a Lorekeeper run:\n" ..
+    "1) Keep pfQuest enabled.\n" ..
+    "2) Quest normally.\n" ..
+    "3) Press |cffffffffResync|r occasionally to lock progress into TLT."
   )
-  TurtleLoreTracker_RefreshRows()
 end
 
 local function TLT_CreateUI()
-  if ui.frame then return end
+  if uiFrame then return end
 
   local frame = CreateFrame("Frame", "TurtleLoreTrackerFrame", UIParent)
-  frame:SetWidth(260)
-  frame:SetHeight(320)
+  uiFrame = frame
+
+  frame:SetWidth(360)
+  frame:SetHeight(260)
   frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
   frame:SetMovable(true)
   frame:EnableMouse(true)
@@ -273,158 +158,100 @@ local function TLT_CreateUI()
   frame:Hide()
 
   frame:SetBackdrop({
-    bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+    bgFile   = "Interface\\Tooltips\\UI-Tooltip-Background",
     edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-    tile = true, tileSize = 16, edgeSize = 16,
-    insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    tile     = true,
+    tileSize = 16,
+    edgeSize = 16,
+    insets   = { left = 4, right = 4, top = 4, bottom = 4 },
   })
-  frame:SetBackdropColor(0, 0, 0, 0.85)
+  frame:SetBackdropColor(0, 0, 0, 0.9)
 
+  -- Title
   local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
   title:SetPoint("TOP", frame, "TOP", 0, -10)
   title:SetText("Turtle Lore Tracker")
 
-  local summary = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  summary:SetPoint("TOP", title, "BOTTOM", 0, -6)
-  summary:SetText("...")
+  -- Progress line
+  progressFS = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  progressFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 16, -40)
+  progressFS:SetJustifyH("LEFT")
 
-  local scroll = CreateFrame("ScrollFrame", "TurtleLoreTrackerScroll", frame, "FauxScrollFrameTemplate")
-  scroll:SetPoint("TOPLEFT", frame, "TOPLEFT", 10, -40)
-  scroll:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -28, 40)
+  -- Info line
+  infoFS = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  infoFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 16, -60)
+  infoFS:SetJustifyH("LEFT")
 
-  local rows = {}
-  local rowsCount = ui.rowsCount
+  -- Body text (give it a bit more space above the hint)
+  bodyFS = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  bodyFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 16, -84)
+  bodyFS:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -16, 36)
+  bodyFS:SetJustifyH("LEFT")
+  bodyFS:SetJustifyV("TOP")
+  bodyFS:SetNonSpaceWrap(true)
 
-  for i = 1, rowsCount do
-    local row = CreateFrame("Button", nil, frame)
-    row:SetHeight(18)
-    row:SetPoint("TOPLEFT", frame, "TOPLEFT", 14, -40 - (i - 1) * 18)
-    row:SetPoint("RIGHT", frame, "RIGHT", -30, 0)
+  -- Close button (pulled slightly inward)
+  local closeBtn = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
+  closeBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -2)
 
-    row.text = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    row.text:SetAllPoints()
-    row.text:SetJustifyH("LEFT")
+  -- Resync button
+  resyncBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+  resyncBtn:SetText("Resync")
+  resyncBtn:SetWidth(80)
+  resyncBtn:SetHeight(22)
+  resyncBtn:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 16, 14)
 
-    row:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
-    row:GetHighlightTexture():SetAlpha(0.25)
-
-    row:SetScript("OnClick", function()
-      if row.zoneKey then
-        TLT_ShowMissingOnMap(row.zoneKey)
-      end
-    end)
-
-    rows[i] = row
-  end
-
-  -- 1.12-compatible scroll handling
-  scroll:SetScript("OnVerticalScroll", function()
-    FauxScrollFrame_OnVerticalScroll(this, arg1, 18, TurtleLoreTracker_RefreshRows)
+  resyncBtn:SetScript("OnClick", function()
+    TLT_ImportPfQuestHistory()
+    TLT_BuildQuestCount()
+    TLT_UpdateDisplay()
+    TLT_Print("Resynced from pfQuest_history into TurtleLoreTrackerDB.")
   end)
 
-  local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
-  close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", 2, 2)
+  -- Hint text (short + fully visible)
+  local hint = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  hint:SetPoint("BOTTOMLEFT", resyncBtn, "BOTTOMRIGHT", 10, 2)
+  hint:SetPoint("RIGHT", frame, "RIGHT", -16, 0)
+  hint:SetJustifyH("LEFT")
+  hint:SetText("Resync now and then to save progress.")
 
-  local resync = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  resync:SetWidth(80)
-  resync:SetHeight(18)
-  resync:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 10, 10)
-  resync:SetText("Resync")
-  resync:SetScript("OnClick", function()
-    TLT_SyncFromPfQuestHistory()
-    TLT_BuildQuestIndex()
-    TurtleLoreTracker_UpdateUI()
-    TLT_Print("Synced with pfQuest history.")
-  end)
-
-  local help = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  help:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -8, 10)
-  help:SetText("Click a zone to show missing via pfQuest")
-
-  ui.frame = frame
-  ui.summary = summary
-  ui.scroll = scroll
-  ui.rows = rows
-  ui.rowsCount = rowsCount
+  TLT_UpdateDisplay()
 end
 
--- ===== Slash commands =====
+-- ############################################################
+-- Events
+-- ############################################################
 
-SLASH_TURTLELORETRACKER1 = "/tlt"
-SLASH_TURTLELORETRACKER2 = "/turtlelore"
+local eventFrame = CreateFrame("Frame")
+eventFrame:RegisterEvent("PLAYER_LOGIN")
 
-SlashCmdList["TURTLELORETRACKER"] = function(msg)
-  msg = msg and string.lower(msg) or ""
+eventFrame:SetScript("OnEvent", function()
+  if event == "PLAYER_LOGIN" then
+    TLT_InitDB()
 
-  if msg == "" or msg == "show" or msg == "toggle" then
-    if not TLT_PfQuestReady() then
-      TLT_Print("pfQuest + pfQuest-turtle required.")
-      return
-    end
-    if not ui.frame then
-      TLT_CreateUI()
-      TurtleLoreTracker_UpdateUI()
-    end
-    if ui.frame:IsShown() then
-      ui.frame:Hide()
+    if TLT_PfQuestReady() then
+      TLT_ImportPfQuestHistory()
+      TLT_BuildQuestCount()
+      TLT_Print("Loaded. Type /tlt to view Lorekeeper progress.")
     else
-      ui.frame:Show()
-      TurtleLoreTracker_UpdateUI()
+      TLT_Print("Loaded. pfQuest not ready; /tlt will still open the tracker.")
     end
-
-  elseif msg == "resync" or msg == "sync" then
-    if not TLT_PfQuestReady() then
-      TLT_Print("pfQuest not ready; cannot resync.")
-      return
-    end
-    TLT_SyncFromPfQuestHistory()
-    TLT_BuildQuestIndex()
-    TurtleLoreTracker_UpdateUI()
-    TLT_Print("Synced with pfQuest history.")
-
-  else
-    TLT_Print("Usage: /tlt [show|resync]")
-  end
-end
-
--- ===== Events =====
-
-frame:RegisterEvent("ADDON_LOADED")
-frame:RegisterEvent("PLAYER_LOGIN")
-frame:RegisterEvent("QUEST_LOG_UPDATE")
-frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-frame:RegisterEvent("CHAT_MSG_SYSTEM") -- we don't parse it; pfQuest does, we just sync
-
-frame:SetScript("OnEvent", function()
-  if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
-    charDB = TLT_GetCharDB()
-
-  elseif event == "PLAYER_LOGIN" then
-    charDB = charDB or TLT_GetCharDB()
-
-    if not TLT_PfQuestReady() then
-      enabled = false
-      TLT_Print("pfQuest + pfQuest-turtle not detected. Tracker idle.")
-      return
-    end
-
-    enabled = true
-    TLT_SyncFromPfQuestHistory()
-    TLT_BuildQuestIndex()
-    TLT_CreateUI()
-    TurtleLoreTracker_UpdateUI()
-    TLT_Print("Loaded. Use /tlt to view Lorekeeper progress.")
-
-  elseif not enabled then
-    return
-
-  elseif event == "QUEST_LOG_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
-    -- pfQuest updates pfQuest_history asynchronously; we just mirror
-    TLT_SyncFromPfQuestHistory()
-    TLT_BuildQuestIndex()
-    TurtleLoreTracker_UpdateUI()
-
-  elseif event == "CHAT_MSG_SYSTEM" then
-    -- pfQuest already listens; our regular sync will pick up any changes.
   end
 end)
+
+-- ############################################################
+-- Slash command
+-- ############################################################
+
+SLASH_TURTLELORETRACKER1 = "/tlt"
+
+SlashCmdList["TURTLELORETRACKER"] = function()
+  TLT_CreateUI()
+  TLT_UpdateDisplay()
+
+  if uiFrame:IsShown() then
+    uiFrame:Hide()
+  else
+    uiFrame:Show()
+  end
+end
